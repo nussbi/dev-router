@@ -1,0 +1,222 @@
+# Confluence (Cloud) gatekeeper
+
+Connects Gadgets to Atlassian Cloud [Confluence](https://www.atlassian.com/software/confluence)
+(`*.atlassian.net`) using OAuth 2.0 (3LO). It exposes spaces, pages, blog posts, comments, labels,
+and attachments through a capability-based Session API, with page/blog bodies converted to and from
+Markdown. Runs as its own Cloudflare Worker and is auto-discovered by the backend from its
+`GATEKEEPER_CONFLUENCE` binding.
+
+Only Atlassian **Cloud** is supported; there is no Server / Data Center adapter.
+
+## What it provides
+
+Three connectable resource granularities:
+
+| Granularity | URL pattern | Session type |
+| --- | --- | --- |
+| **Site** — search and open any space/page/blog post the account can access | `https://*.atlassian.net/wiki` | `ConfluenceSite` |
+| **Space** — list/search/create pages and blog posts within one space | `https://*.atlassian.net/wiki/spaces/:spaceKey` | `ConfluenceSpace` |
+| **Page or blog post** — read/edit the body, manage labels/comments/attachments, and (pages only) read/create child pages | `https://*.atlassian.net/wiki/spaces/:spaceKey/pages/:pageId/*` | `ConfluenceContent` |
+
+Pages and blog posts share the `ConfluenceContent` session type (distinguished by
+`ContentMetadata.type`); child-page methods are page-only.
+
+A single account-level grant can span multiple sites. `getGatekeeperClassFor()` resolves a URL's
+host to one of the connection's accessible sites (its cloud ID) — the one chokepoint enforcing site
+access.
+
+See `src/types.d.ts` for the full, agent-facing Session API.
+
+## Setting up an Atlassian OAuth 2.0 app
+
+1. Go to the [Atlassian Developer Console](https://developer.atlassian.com/console/myapps/) and
+   create an **OAuth 2.0 integration**.
+2. Add the **Confluence API** to the app and enable **both** scope families below (see
+   `CONFLUENCE_SCOPES` in `confluence-api.ts`). The console has separate **Granular scopes** and
+   **Classic scopes** tabs; this gatekeeper needs scopes from each because it uses the v2 API for
+   most operations and falls back to v1 for a few (search, label writes, attachment upload,
+   restore).
+
+   **Granular scopes** (authorize the v2 API — v2 doesn't accept classic scopes):
+   - `read:space:confluence`
+   - `read:page:confluence`, `write:page:confluence`, `delete:page:confluence`
+   - `read:blogpost:confluence`, `write:blogpost:confluence`, `delete:blogpost:confluence`
+   - `read:comment:confluence`, `write:comment:confluence`, `delete:comment:confluence`
+   - `read:label:confluence`, `write:label:confluence`
+   - `read:attachment:confluence`, `write:attachment:confluence`, `delete:attachment:confluence`
+   - `read:user:confluence`
+   - `read:hierarchical-content:confluence` (the resource picker's content tree: folders,
+     whiteboards, databases)
+
+   **Classic scopes** (authorize the v1 fallbacks — v1 doesn't accept granular scopes):
+   - `search:confluence` (CQL search)
+   - `read:confluence-content.all`, `read:confluence-content.summary` (search results / content reads)
+   - `read:confluence-space.summary`
+   - `write:confluence-content` (label add/remove, restore-from-trash)
+   - `write:confluence-file` (attachment upload)
+   - `readonly:content.attachment:confluence` (attachment download)
+   - `read:confluence-user`
+
+   **Account-level:**
+   - `read:me` (authorizing user's identity)
+   - `offline_access` (required for refresh tokens)
+3. Under **Authorization**, set the callback URL to `<BASE_URL>/oauth`:
+   - `http://localhost:8787/gatekeeper/confluence/oauth` for local dev
+   - `<PUBLIC_BASE_URL>/gatekeeper/confluence/oauth` otherwise
+4. Copy the app's **Client ID** and **Secret**.
+
+> **API version:** this gatekeeper targets the Confluence **v2** REST API (`/wiki/api/v2/...`),
+> which Atlassian now requires (the v1 content/space endpoints have been removed) — and which is
+> why the **granular** scopes are needed. A few capabilities with no v2 equivalent (CQL search,
+> label add/remove, attachment upload, restore-from-trash) fall back to v1 endpoints, which need
+> the **classic** scopes, and degrade with a clear error if Atlassian has removed them too. The app
+> therefore must enable scopes from both the Granular and Classic tabs.
+
+## Configuring credentials
+
+For local development, set these in the repo-root environment (e.g. `.dev.vars`) so the dev server
+injects them into this Worker:
+
+```
+CONFLUENCE_CLIENT_ID=your-client-id
+CONFLUENCE_CLIENT_SECRET=your-client-secret
+```
+
+`run-dev-server.ts` maps `CONFLUENCE_CLIENT_ID` / `CONFLUENCE_CLIENT_SECRET` into the Worker's
+`CLIENT_ID` / `CLIENT_SECRET` vars. For production, set `CLIENT_ID` and `CLIENT_SECRET` as secrets
+on the deployed Worker and set `BASE_URL` to the public gatekeeper URL.
+
+`providesAuth` is false: Confluence is a data connector, not a sign-in method. Wiring it up as a
+"Sign in with Atlassian" provider (using the verified `/me` email) is a possible fast follow.
+
+## How the connect flow works
+
+1. The user starts a connection; `connectAccount()` creates a `UserAccount` Durable Object and
+   returns a URL of the form `<BASE_URL>/<doId>/<nonce>`. The flow uses a two-phase nonce
+   (initiation → OAuth).
+2. Visiting that URL redirects to `auth.atlassian.com` to authorize the requested scopes.
+3. Atlassian redirects back to `<BASE_URL>/oauth`; the gatekeeper exchanges the code for access +
+   rotating refresh tokens, lists the account's accessible Confluence sites
+   (`/oauth/token/accessible-resources`), reads the authorizing user's identity (`/me`), and stores
+   them.
+4. Each connected resource routes API calls through
+   `https://api.atlassian.com/ex/confluence/<cloudId>/wiki/...`. Access tokens are short-lived and
+   refreshed automatically (proactively before expiry and again on a 401); each refresh persists
+   the **new** rotating refresh token.
+
+A connection is created either by pasting a Confluence URL into the chat, or from the Connections
+UI.
+
+## API
+
+Page/blog bodies are exchanged as **Markdown** (best-effort conversion to/from Confluence "storage
+format" XHTML; see `confluence-markdown.ts`). Highlights:
+
+- `ConfluenceSite`: `listSpaces`, `getSpace`, `getContent`, `search` (text or raw CQL),
+  `getCurrentUser`
+- `ConfluenceSpace`: `listPages`, `listBlogPosts`, `getContent`, `search`, `createPage`,
+  `createBlogPost`
+- `ConfluenceContent`: `getMetadata`/`getContent`, `setContent`/`appendContent`/`setTitle`,
+  `listChildPages`/`createChildPage`, labels, comments, attachments
+  (`downloadAttachment` is capped at 16 KB), `trash`/`restore`
+
+Endpoint split: v2 for spaces, pages, blog posts, child pages, and reading comments/labels/
+attachments; v1 (with graceful degradation) for CQL search, label add/remove, attachment upload,
+and restore-from-trash.
+
+## Approvals, caching & simulation
+
+Every read calls `ApprovalQueue.authorizeObservation()`; every side-effecting operation
+(create/edit page or blog post, comments, labels, attachment upload, trash/restore) is recorded as
+a pending action and submitted via `submitAction()` — nothing reaches Confluence until the Overseer
+calls `applyAction()`. A user can let creates, edits, renames, comments, labels, attachment uploads
+and restores apply without review, each kind on its own; moving content to the trash always waits
+for a person. Reads simulate pending (unapproved) writes so the agent can keep working
+before approval (provisional IDs for created content, body/title/label/comment overlays, trashed
+state). `rejectAction()` / `revertAction()` discard or undo. Content responses are cached in DO
+storage with a short TTL and invalidated on write. This logic lives in `confluence-actions.ts`.
+
+## Observer verification
+
+All three bindings use strategy C: Confluence access is not hierarchical, so a site member may not
+see every space, and a page can be more restricted than its space or parent. Every read, each
+cursor page included (an empty or simulated one too), reports the resources it depends on as
+`ObservationDescription.subresources` (`src/confluence-subresources.ts`), through one typed helper
+(`authorizeRead`) that makes the field required:
+
+| Binding | Reported on every read | Plus, per read |
+| --- | --- | --- |
+| Site | `site/<cloudId>` | `site/<cloudId>/space/<spaceId>` for each space a listing or `getSpace()` returns; `site/<cloudId>/content/<contentId>` for each search hit and each content item a content session reads |
+| Space | `site/<cloudId>/space/<spaceKey>` | `site/<cloudId>/content/<contentId>` for each listed page/blog post, search hit, and content item a content session reads |
+| Page / blog post | `site/<cloudId>/content/<contentId>` | `site/<cloudId>/content/<childId>` for each listed child page |
+
+Content a Gadget has staged but Confluence has not created (a `~` ID) is never reported, but
+its reads report what its creation read, the parent page whose space it names and the space a
+site binding opened it in, from whichever session reaches it, by its handle, a listing or a search. Sessions
+opened through a binding (a space or content session from a site binding, say) keep reporting that
+binding's resource. A space session opened by a site binding's `getSpace()` also reports that
+space, `site/<cloudId>/space/<spaceId>`, on every read, as do the content sessions opened through
+it, since site access doesn't imply access to the space. The site prefix only identifies where a
+space or content item lives; it asks nothing beyond that resource itself.
+
+`verifyObserverAccess()` refuses, for every observer, any ID that is not one of these, names
+another site, or names a kind the binding never reports (a site on a space or content binding, a
+space on a content binding, another space on a space binding). It then asks each observer's
+`ConfluenceVerifier.checkSubresourceAccess()`, which their `UserAccount` answers with their own
+token: sites from one live `accessible-resources` listing (never the `sites` saved at connect),
+spaces and content by retrieving them, at most four requests at a time. Only a 403/404, or a site
+the live listing leaves out, is a denial; credentials that can't be obtained or refreshed, rate
+limits and outages throw, which denies every observer in the call. Answers are cached under
+`cache:@access:` (a `KvTtlCache` named `access`) for 15 minutes when allowed and 15 seconds when
+denied, partitioned by `credentialsId`: a UUID replaced on every connect and reconnect (not on a
+token refresh), named lazily for an account connected before it existed, and deleted on revoke.
+
+Reads no longer feed the legacy `ConfluenceObserverTracker` or set `excludeObservers`. Its
+`observed:space:<id>` / `observed:content:<id>` markers and `observer:<id>` verifiers stay, and
+`addObserver()` still checks the binding baseline (site, space, or content access) and every
+recorded set, for reads made before they reported subresources and reads by an older Worker
+version during rollout. `getHistoricalSubresources()` exports the same requirements, read from
+storage only: the binding baseline (`site/<cloudId>`, `site/<cloudId>/space/<spaceKey>`, or
+`site/<cloudId>/content/<contentId>`) and each recorded set as the subresource reads report it
+(`site/<cloudId>/space/<spaceId>` or `site/<cloudId>/content/<contentId>`), all IDs the binding's
+`verifyObserverAccess()` accepts.
+
+## Resource picker
+
+The three resource types are grouped (`groupedWith`) into one Confluence card, and one configurator
+frame (`src/configurator/confluence-configurator-ui.tsx`, served by `confluence-configurator.ts`)
+chooses among them. It is the shared `HierarchyPicker` from `@gadgets/configurator-ui`, with the
+whole site above and three tabs: recently viewed pages, what the user starred (spaces, pages and
+blog posts) and every space. A space
+opens into its home page, blog and page tree; search covers the whole site (titles, or a pasted
+link, short `/wiki/x/…` links included). Rows use Confluence's own icons; space avatars are fetched
+after the rows show (`spaceAvatars`), so no listing waits on them. Icon downloads accept only an
+HTTPS redirect to Atlassian's media host, send it no OAuth token, refuse further redirects, and
+enforce a byte cap on both declared and streamed bodies. The frame
+trades refs; `resourceUrlFor` writes the resource URL, always in the page-shaped form for pages and
+blog posts, so the URL patterns and every existing binding are unchanged. Pasting a resource URL, or
+an agent's `requestConnection(resourceUrl)`, opens the picker where it lives; one this connection
+can't open pre-fills nothing, never the whole site. When the Workshop accepts only some resource
+types (a blueprint binding), the rest can be opened but not chosen.
+
+Folders, whiteboards, databases and embeds are listed through Confluence's content-tree endpoints,
+which need `read:hierarchical-content:confluence`. A grant without it (connected before the scope
+was added) still lists pages, with a notice to reconnect; the scopes a grant holds are recorded
+from the token response, since `accessible-resources` doesn't list this one. **An Atlassian app
+must enable the scope before this version is deployed**, or new connections fail with
+`invalid_scope`.
+
+## Notes and current limitations
+
+- Body conversion between Confluence storage format and Markdown is best-effort; unsupported macros
+  degrade to a labeled placeholder.
+- `author` / `lastUpdatedBy` expose only an `accountId` (the v2 content API returns IDs, not user
+  objects).
+- CQL search, label add/remove, attachment upload, and restore-from-trash rely on v1 endpoints; if
+  Atlassian removes them, those operations surface a clear "not available" error.
+
+## Development
+
+- `pnpm exec vp run -F @gadgets/confluence-gatekeeper build` — build the configurator UI (`build:configurator`, which this task depends on) and type-check (`tsc`). A Vite+ task rather than a script, so `pnpm --filter` cannot see it.
+- `pnpm --filter @gadgets/confluence-gatekeeper test:run` — build the configurator frame, then run the unit tests (URL/CQL parsing, Markdown conversion, v2 converters, icon redirect and byte-limit enforcement, action simulation, the configurator against a fake Confluence, observer subresource reporting and access checks against a fake Atlassian) and the frame's journeys in Chromium (`__tests__/configurator-frame.test.ts`, through `__tests__/frame-host.ts`).
+- The Worker is run via the root `pnpm dev-server`, not directly.

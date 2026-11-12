@@ -1,0 +1,964 @@
+import type { ObservationDescription } from "@gadgets/workshop-shared/gatekeeper";
+import { CursorPager, type Pager } from "./cursor";
+import {
+  FOLDER_MIME_TYPE, MAX_QUERY_PARENTS, SHORTCUT_MIME_TYPE,
+  isFileInvisible, isInsufficientScope, isListableFolderFile, isListableFolderNode,
+  type DriveApi, type DriveCommentList, type DriveFile, type DriveListFilesOptions,
+  type DriveScopeNode,
+} from "./drive-api";
+import {
+  isDirectChild, outsideScope, readFolderLocation,
+  type FolderLocation,
+} from "./drive-folder-scope";
+import type { DriveObservation } from "./drive-observers";
+import { fileSubresourceIds, type FileSubresource } from "./file-subresources";
+import type {
+  DriveBindingAccess, DriveComment, DriveEntry, DriveFolderListOptions, DriveFolderSearchQuery,
+  DriveListOptions, DriveOrder, DriveScope, DriveSearchQuery,
+} from "./drive-types";
+
+/** Exact MIME type for native Google Docs files. */
+export const GOOGLE_DOC_MIME_TYPE = "application/vnd.google-apps.document";
+/** Exact MIME type for native Google Sheets files. */
+export const GOOGLE_SHEET_MIME_TYPE = "application/vnd.google-apps.spreadsheet";
+/** Exact MIME type for native Google Slides files. */
+export const GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation";
+/** Exact MIME type Drive gives a PDF. */
+export const PDF_MIME_TYPE = "application/pdf";
+
+const FOLDER_MOVED = "The connected Drive folder moved to another drive; open a new listing.";
+
+// Agent-supplied query values go in the approval description, so each value and the whole string
+// are capped. They are not logged and they stay out of the title.
+const MAX_OBSERVATION_VALUE = 32;
+const MAX_OBSERVATION_DESCRIPTION = 240;
+
+/** Immutable authority carried by one Drive gatekeeper binding. */
+export type DriveBindingScope =
+  | { kind: "account" }
+  | { kind: "folder"; folderId: string }
+  | { kind: "file"; fileId: string };
+
+/**
+ * Refuses a binding whose persisted scope predates this model rather than widening it: an
+ * unrecognized kind would fall through every narrow check and be served as account scope.
+ */
+export function requireDriveBindingScope(scope: DriveBindingScope): DriveBindingScope {
+  switch (scope.kind) {
+    case "account":
+    case "folder":
+    case "file":
+      return scope;
+  }
+  throw new Error(
+    "This Google Drive connection predates the current folder resource. Remove it and connect " +
+    "the folder or shared drive again.");
+}
+
+type DriveSessionScope = Exclude<DriveBindingScope, { kind: "folder" }>;
+type DriveSessionApi =
+  Pick<DriveApi, "listFiles" | "getFile" | "getScopeNodes" | "canComment" | "listComments">;
+/** A page's proven scope: the bound drive, and the parents its files must sit directly under. */
+type FolderPageScope = {driveId: string | undefined; parents: DriveScopeNode[]};
+
+/**
+ * An observation description before the read reports what it depends on: the {@link NativeRead}
+ * adds the subresources, and any observer exclusions, itself.
+ */
+export type NativeObservation = Omit<ObservationDescription, "excludeObservers" | "subresources">;
+
+/**
+ * Authorizes one disclosure. `subresources` is required because nothing else records what a Drive,
+ * Docs, Sheets or Slides read depends on: an observation without it would leave later observers
+ * unchecked against what it read.
+ */
+export type SubresourceAuthorizer =
+  (description: ObservationDescription & {subresources: string[]}) => Promise<void>;
+
+/**
+ * Performs one Docs, Sheets, Slides, PDF or file content read and authorizes it before the value
+ * is disclosed, reporting the file it read (see file-subresources.ts) and whatever its scope
+ * check proved.
+ *
+ * The fetch is a thunk rather than a value so a scope check can refuse before the provider is
+ * contacted at all.
+ */
+export type NativeRead = <T>(
+  fetch: () => Promise<T>,
+  observe: (value: T) => NativeObservation,
+) => Promise<T>;
+
+/** How a session core's `nativeRead` treats one read. */
+export type NativeReadOptions = {
+  /**
+   * Discloses the file's content -- its bytes or a PDF's text -- rather than what a viewer sees, so
+   * the read reports the file's content, which an observer passes only with leave to download.
+   */
+  content?: boolean;
+  /**
+   * Folder bindings only: sees the file's metadata from each re-proof, before and after the fetch,
+   * and throws to refuse a read of a file that has changed since it was opened.
+   */
+  unchanged?: (file: DriveFile) => void;
+};
+
+/**
+ * Reads and authorizes with no live scope check, for a binding whose scope cannot move. Every read
+ * reports `subresources`: the file it reads, or none for one not created yet.
+ */
+export function unguardedNativeRead(
+  authorize: SubresourceAuthorizer,
+  subresources: readonly FileSubresource[],
+): NativeRead {
+  let ids = fileSubresourceIds(subresources);
+  return async <T>(fetch: () => Promise<T>, observe: (value: T) => NativeObservation) => {
+    let value = await fetch();
+    await authorize({...observe(value), subresources: ids});
+    return value;
+  };
+}
+
+/**
+ * What a read of Drive file `fileId` reads: the file's content when Drive downloads it, and
+ * otherwise the Doc, Sheet or Slides presentation its own API names.
+ */
+function nativeSubresource(fileId: string, mimeType: string, content = false): FileSubresource {
+  if (content) return {kind: "content", fileId};
+  switch (mimeType) {
+    case GOOGLE_DOC_MIME_TYPE: return {kind: "document", fileId};
+    case GOOGLE_SHEET_MIME_TYPE: return {kind: "spreadsheet", fileId};
+    case GOOGLE_SLIDES_MIME_TYPE: return {kind: "presentation", fileId};
+  }
+  throw new Error(`Google Drive has no native read of ${mimeType} files.`);
+}
+
+/**
+ * Everything one Drive session core enforces and reports through.
+ *
+ * `authorize` is part of the construction because it is the one thing that differs between the
+ * cores a session builds: they share its scope, but a capability handed to the caller -- a cursor,
+ * a native child -- authorizes through an approval queue with its own lifetime.
+ */
+export type DriveSessionCoreOptions = {
+  api: DriveSessionApi;
+  scope: DriveSessionScope;
+  /** The binding's access, which `getScope()` reports with its scope. */
+  access: DriveBindingAccess;
+  authorize: SubresourceAuthorizer;
+};
+
+/** Construction contract for one positioned folder capability core. */
+export type DriveFolderSessionCoreOptions = Omit<DriveSessionCoreOptions, "scope"> & {
+  location: FolderLocation;
+};
+
+/** Either core a Drive session can be driving. */
+export type DriveCore = DriveSessionCore | DriveFolderSessionCore;
+
+/** An in-scope file comments are read or written on, as its scope check found it. */
+export type CommentTarget = {
+  fileId: string;
+  /** The file's current name, which a write's approval shows beside its ID. */
+  name: string;
+  mimeType?: string;
+  /** For a folder binding, the path from the bound root to the file's parent. */
+  folderIds?: string[];
+};
+
+/** One page of a file's comments, as the caller sees it. */
+export type CommentPage = {
+  comments: DriveComment[];
+  nextPageToken?: string;
+  /**
+   * Whether the page shows what this binding read from the file as a Google Doc: a comment
+   * awaiting approval that quotes it. Such a page reports the document as well.
+   */
+  quotesDocument?: boolean;
+};
+
+/**
+ * Fetches one page of a file's comments with `fetch` and maps it to what the caller sees, with
+ * whatever this binding has queued for the file.
+ */
+export type CommentPageReader = (fetch: () => Promise<DriveCommentList>) => Promise<CommentPage>;
+
+function requiredString(value: string | undefined, field: string): string {
+  if (!value) throw new Error(`Google Drive omitted required file ${field}`);
+  return value;
+}
+
+/** Drive's `modifiedTime`, validated. */
+export function driveModifiedTime(file: DriveFile): Date {
+  let modifiedTime = new Date(requiredString(file.modifiedTime, "modifiedTime"));
+  if (Number.isNaN(modifiedTime.valueOf())) {
+    throw new Error("Google Drive returned an invalid modifiedTime");
+  }
+  return modifiedTime;
+}
+
+/** Maps one validated provider file to the permanent agent-facing declaration. */
+export function driveFileToEntry(file: DriveFile): DriveEntry {
+  let mimeType = requiredString(file.mimeType, "mimeType");
+  let isFolder = mimeType === FOLDER_MIME_TYPE;
+  let isShortcut = mimeType === SHORTCUT_MIME_TYPE;
+  let modifiedTime = driveModifiedTime(file);
+
+  let size: number | undefined;
+  if (file.size !== undefined && !isFolder && !isShortcut) {
+    size = Number(file.size);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new Error("Google Drive returned an invalid file size");
+    }
+  }
+  let owner = file.driveId ? undefined : file.owners?.[0];
+  let shortcut: DriveEntry["shortcut"];
+  if (isShortcut && file.shortcutDetails) {
+    shortcut = {
+      targetId: requiredString(file.shortcutDetails.targetId, "shortcut targetId"),
+      ...(file.shortcutDetails.targetMimeType ?
+        { targetMimeType: file.shortcutDetails.targetMimeType } : {}),
+    };
+  }
+  return {
+    id: file.id,
+    name: file.name,
+    mimeType,
+    isFolder,
+    modifiedTime,
+    ...(size === undefined ? {} : { size }),
+    ...(owner ? {
+      owner: {
+        ...(owner.displayName ? { displayName: owner.displayName } : {}),
+        ...(owner.emailAddress ? { emailAddress: owner.emailAddress } : {}),
+      },
+    } : {}),
+    ...(file.parents?.[0] ? { parentId: file.parents[0] } : {}),
+    ...(file.driveId ? { driveId: file.driveId } : {}),
+    ...(file.webViewLink ? { webViewLink: file.webViewLink } : {}),
+    ...(shortcut ? { shortcut } : {}),
+  };
+}
+
+const ORDER_BY: Record<DriveOrder, string> = {
+  modifiedTimeDesc: "modifiedTime desc",
+  modifiedTimeAsc: "modifiedTime",
+  nameAsc: "name",
+  nameDesc: "name desc",
+};
+
+function orderBy(order: DriveOrder | undefined): string {
+  if (order === undefined) return ORDER_BY.modifiedTimeDesc;
+  let result = ORDER_BY[order];
+  if (!result) throw new Error(`Unsupported Drive order: ${order}`);
+  return result;
+}
+
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function timestamp(value: string | undefined, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (!RFC3339.test(value) || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`${field} must be an RFC 3339 timestamp`);
+  }
+  return value;
+}
+
+/**
+ * A supplied parent is a narrowing the caller asked for, so a blank one is refused.
+ *
+ * Dropping it as if it were absent widens the read to the whole binding, which is the opposite of
+ * what was asked; a blank name or text filter only matches more within the same scope.
+ */
+function narrowingParentId(directParentId?: string): string | undefined {
+  if (directParentId === undefined) return undefined;
+  let trimmed = directParentId.trim();
+  if (!trimmed) {
+    throw new Error("directParentId must not be blank; omit it to read the whole binding.");
+  }
+  return trimmed;
+}
+
+/**
+ * Like {@link narrowingParentId}: a set naming nothing would widen the search, so it is refused.
+ *
+ * Checked here as well as in the query builder so a caller learns synchronously rather than from
+ * the first page of a cursor it already holds.
+ */
+function narrowingChildFolderIds(ids?: readonly string[]): string[] | undefined {
+  if (ids === undefined) return undefined;
+  let trimmed = [...new Set(ids.map(id => id.trim()).filter(Boolean))];
+  if (!trimmed.length) {
+    throw new Error("childFolderIds must name at least one folder; omit it to search this folder.");
+  }
+  if (trimmed.length > MAX_QUERY_PARENTS) {
+    throw new Error(
+      `childFolderIds accepts at most ${MAX_QUERY_PARENTS} folders; search them in batches.`);
+  }
+  return trimmed;
+}
+
+function normalizeSearch(query: DriveSearchQuery): DriveSearchQuery {
+  let namePrefix = query.namePrefix?.trim();
+  let fullTextContains = query.fullTextContains?.trim();
+  let directParentId = narrowingParentId(query.directParentId);
+  let mimeTypes = query.mimeTypes?.map(value => value.trim()).filter(Boolean);
+  let modifiedAfter = query.modifiedAfter
+    ? timestamp(query.modifiedAfter, "modifiedAfter")
+    : undefined;
+  let modifiedBefore = query.modifiedBefore
+    ? timestamp(query.modifiedBefore, "modifiedBefore")
+    : undefined;
+  let normalized: DriveSearchQuery = {};
+  if (namePrefix) normalized.namePrefix = namePrefix;
+  if (fullTextContains) normalized.fullTextContains = fullTextContains;
+  if (mimeTypes?.length) normalized.mimeTypes = mimeTypes;
+  if (modifiedAfter) normalized.modifiedAfter = modifiedAfter;
+  if (modifiedBefore) normalized.modifiedBefore = modifiedBefore;
+  if (directParentId) normalized.directParentId = directParentId;
+  if (query.order) normalized.order = query.order;
+
+  if (Object.keys(normalized).every(key => key === "order")) {
+    throw new Error("Drive search requires at least one filter");
+  }
+  if (normalized.fullTextContains && normalized.order) {
+    throw new Error("Drive full-text search cannot specify an order");
+  }
+  if (normalized.modifiedAfter && normalized.modifiedBefore &&
+      Date.parse(normalized.modifiedAfter) >= Date.parse(normalized.modifiedBefore)) {
+    throw new Error("modifiedAfter must be earlier than modifiedBefore");
+  }
+  return normalized;
+}
+
+function clip(value: string, max: number): string {
+  return value.length <= max ? value : `${value.slice(0, max)}...`;
+}
+
+function scopePhrase(scope: DriveBindingScope): string {
+  switch (scope.kind) {
+    case "account": return "the connected Drive account";
+    case "folder": return `folder ${scope.folderId}`;
+    case "file": return `file ${scope.fileId}`;
+  }
+}
+
+function queryClauses(query: DriveListFilesOptions): string[] {
+  let parts: string[] = [];
+  if (query.namePrefix) {
+    parts.push(`name starts with "${clip(query.namePrefix, MAX_OBSERVATION_VALUE)}"`);
+  }
+  if (query.fullTextContains) {
+    parts.push(`full text contains "${clip(query.fullTextContains, MAX_OBSERVATION_VALUE)}"`);
+  }
+  if (query.mimeTypes?.length) {
+    parts.push(`mime types ${query.mimeTypes.map(value => clip(value, MAX_OBSERVATION_VALUE)).join(", ")}`);
+  }
+  if (query.modifiedAfter) parts.push(`modified after ${query.modifiedAfter}`);
+  if (query.modifiedBefore) parts.push(`modified before ${query.modifiedBefore}`);
+  if (query.directParentIds?.length) {
+    let noun = query.directParentIds.length === 1 ? "parent" : "parents";
+    parts.push(
+      `${noun} ${query.directParentIds.map(id => clip(id, MAX_OBSERVATION_VALUE)).join(", ")}`);
+  }
+  return parts;
+}
+
+function listingDescription(
+  scope: DriveBindingScope,
+  query: DriveListFilesOptions,
+  count: number,
+): string {
+  let noun = count === 1 ? "entry" : "entries";
+  let clauses = queryClauses(query);
+  let text = `Read metadata for ${count} Drive ${noun} in ${scopePhrase(scope)}`;
+  if (clauses.length) text += `; ${clauses.join("; ")}`;
+  return clip(`${text}.`, MAX_OBSERVATION_DESCRIPTION);
+}
+
+/**
+ * The disclosure protocol both cores run: reporting the Drive units each read depends on, and the
+ * per-page authorization rule.
+ *
+ * Shared rather than copied because what a page reports is security-relevant, and two copies of a
+ * security rule drift without saying so.
+ */
+abstract class DriveCoreBase {
+  protected readonly api: DriveSessionApi;
+  protected readonly access: DriveBindingAccess;
+  protected readonly authorize: SubresourceAuthorizer;
+
+  constructor(options: Omit<DriveSessionCoreOptions, "scope">) {
+    this.api = options.api;
+    this.access = options.access;
+    this.authorize = options.authorize;
+  }
+
+  /** Authorize one disclosure, reporting every unit in `observations` as a subresource. */
+  protected authorizeUnits(
+    observations: DriveObservation[], title: string, description: string,
+  ): Promise<void> {
+    return this.authorize({title, description, subresources: fileSubresourceIds(observations)});
+  }
+
+  /** {@link authorizeUnits} for plain file IDs. */
+  protected authorizeFiles(
+    fileIds: readonly string[], title: string, description: string,
+  ): Promise<void> {
+    return this.authorizeUnits(
+      fileIds.map(fileId => ({kind: "file", fileId})), title, description);
+  }
+
+  /**
+   * Authorize a read whose answer is relative to the connected account rather than to any file,
+   * such as that it cannot list a folder or see a file. Nothing restricts who may see that, so it
+   * reports no subresources.
+   */
+  protected authorizeAccountRelative(title: string, description: string): Promise<void> {
+    return this.authorize({title, description, subresources: []});
+  }
+
+  /** Validate one file against this scope and authorize opening it as a `description`. */
+  abstract openFile(fileId: string, description: string): Promise<DriveFile>;
+
+  /** {@link openFile} for a native file of one type, before a nested content session is created. */
+  async openNativeFile(
+    fileId: string,
+    expectedMimeType: string,
+    description: string,
+  ): Promise<string> {
+    let file = await this.openFile(fileId, description);
+    if (file.mimeType !== expectedMimeType) {
+      throw new Error(`The requested Drive file is not a ${description}.`);
+    }
+    return file.id;
+  }
+
+  /**
+   * Refuses a file the connected account can only view. Google shows a file's comments only to
+   * accounts that can comment on it, and answers the listing of an account that can only view the
+   * file with none, which would read as a file without comments. The check is about the connected
+   * account alone, so a file it can comment on observes nothing, and a refusal is reported with no
+   * subresource. A failure of the check itself leaves as it came, with nothing reported.
+   */
+  async requireCommentable(fileId: string): Promise<void> {
+    if (await this.api.canComment(fileId)) return;
+    await this.authorizeAccountRelative("Check Google Drive file access",
+      `Check whether the connected account can comment on Drive file ${fileId}.`);
+    throw new Error(`The connected account can only view Drive file ${fileId}. Google shows a ` +
+      "file's comments only to accounts that can comment on it, so this file's comments cannot " +
+      "be read or added to here.");
+  }
+
+  /**
+   * Pages through a file's comments, reporting each page with `units`, which are what reading the
+   * file reports, and with the document when the page shows a comment that quotes it. `revalidate`
+   * runs before each fetch and again after it, where the file can leave scope.
+   */
+  protected commentPages(
+    fileId: string,
+    units: readonly DriveObservation[],
+    readPage: CommentPageReader,
+    revalidate?: () => Promise<unknown>,
+  ): Pager<DriveComment> {
+    // Whether the page fetched last shows a comment quoting the document. The cursor runs its
+    // calls one at a time and offers only the page it fetched last, having walked past those that
+    // hold no comment, so an authorization reads what its own page showed: never what a call that
+    // failed, or was refused, fetched and did not disclose.
+    let quotesDocument = false;
+    return new CursorPager<DriveComment, DriveComment>({
+      provider: "Google Drive",
+      fetchPage: async pageToken => {
+        await revalidate?.();
+        let page = await readPage(
+          () => this.api.listComments(fileId, pageToken ? {pageToken} : {}));
+        quotesDocument = page.quotesDocument === true;
+        return {
+          items: page.comments, ...(page.nextPageToken ? {nextPageToken: page.nextPageToken} : {}),
+        };
+      },
+      buildEntries: async comments => {
+        await revalidate?.();
+        return comments;
+      },
+      authorize: async comments => {
+        let document: FileSubresource[] = quotesDocument ? [{kind: "document", fileId}] : [];
+        await this.authorize({
+          title: "Read Google Drive comments",
+          description: `Read ${comments.length} ${comments.length === 1 ? "comment" : "comments"} ` +
+            `on Drive file ${fileId}.`,
+          subresources: fileSubresourceIds([...units, ...document]),
+        });
+      },
+    });
+  }
+
+  /** Current metadata for one file, or `undefined` when it is invisible to this account. */
+  protected async tryFetchFile(fileId: string): Promise<DriveFile | undefined> {
+    try {
+      return await this.api.getFile(fileId);
+    } catch (error) {
+      if (isInsufficientScope(error)) throw error;
+      if (isFileInvisible(error)) return undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * The per-page authorization rule: disclose the page, empty or not.
+   *
+   * `revalidate` runs first where the scope can move under the cursor, and `baseUnits` are the
+   * units every page of that scope also discloses.
+   */
+  protected pageAuthorizer(
+    scope: DriveBindingScope,
+    query: DriveListFilesOptions,
+    options: {
+      revalidate?: () => Promise<unknown>;
+      baseUnits?: readonly DriveObservation[];
+    } = {},
+  ): (entries: DriveEntry[]) => Promise<void> {
+    return async entries => {
+      await options.revalidate?.();
+      await this.authorizeUnits(
+        [
+          ...(options.baseUnits ?? []),
+          ...entries.map(entry => ({kind: "file" as const, fileId: entry.id})),
+        ],
+        "Read Google Drive metadata",
+        listingDescription(scope, query, entries.length),
+      );
+    };
+  }
+}
+
+/** Scope enforcement, pagination, mapping, and observation authorization for account/file sessions. */
+export class DriveSessionCore extends DriveCoreBase {
+  #scope: DriveSessionScope;
+
+  constructor(options: DriveSessionCoreOptions) {
+    super(options);
+    this.#scope = options.scope;
+  }
+
+  async getScope(): Promise<DriveScope> {
+    if (this.#scope.kind === "account") return {kind: "account", access: this.access};
+    let file = await this.#fetchFile(this.#scope.fileId);
+    if (file.id !== this.#scope.fileId) outsideScope();
+    await this.authorizeFiles([file.id], "Read Google Drive scope",
+      "Read the current name of the connected Drive file.");
+    return {kind: "file", fileId: file.id, name: file.name, access: this.access};
+  }
+
+  async list(options: DriveListOptions = {}): Promise<Pager<DriveEntry>> {
+    let directParentId = narrowingParentId(options.directParentId);
+    if (directParentId) await this.#assertParent(directParentId);
+    if (this.#scope.kind === "file") return this.#exactFileCursor();
+    return this.#cursor({
+      ...(directParentId ? {directParentIds: [directParentId]} : {}),
+      orderBy: orderBy(options.order),
+    });
+  }
+
+  async search(query: DriveSearchQuery): Promise<Pager<DriveEntry>> {
+    rejectChildFolders(query);
+    if (this.#scope.kind === "file") {
+      throw new Error(
+        "A single-file Drive binding cannot be searched; use getEntry() to read the bound file.");
+    }
+    let normalized = normalizeSearch(query);
+    if (normalized.directParentId) await this.#assertParent(normalized.directParentId);
+    let {directParentId, ...filters} = normalized;
+    return this.#cursor({
+      ...filters,
+      ...(directParentId ? {directParentIds: [directParentId]} : {}),
+      orderBy: normalized.fullTextContains ? null : orderBy(normalized.order),
+    });
+  }
+
+  async getEntry(fileId: string): Promise<DriveEntry> {
+    if (this.#scope.kind === "file" && fileId !== this.#scope.fileId) outsideScope();
+    let file = await this.#fetchFile(fileId);
+    if (file.id !== fileId) outsideScope();
+    await this.authorizeFiles([file.id], "Read Google Drive metadata",
+      `Read metadata for Drive file ${file.id}.`);
+    return driveFileToEntry(file);
+  }
+
+  async openFile(fileId: string, description: string): Promise<DriveFile> {
+    if (this.#scope.kind === "file" && fileId !== this.#scope.fileId) outsideScope();
+    let file = await this.#fetchFile(fileId);
+    if (file.id !== fileId) outsideScope();
+    await this.authorizeFiles([file.id], `Open ${description} from Google Drive`,
+      `Check current metadata for Drive file ${file.id} and open it as a ${description}.`);
+    return file;
+  }
+
+  /**
+   * An account or exact-file capability's scope cannot move, so its reads need no live scope check
+   * and re-read no metadata for `unchanged` to see. Each reports the file it reads;
+   * openNativeFile() already reported its Drive metadata.
+   */
+  nativeRead(
+    fileId: string, expectedMimeType: string, {content}: NativeReadOptions = {},
+  ): NativeRead {
+    return unguardedNativeRead(
+      this.authorize, [nativeSubresource(fileId, expectedMimeType, content)]);
+  }
+
+  /** Validate and authorize one file whose comments are about to be read or written. */
+  async commentTarget(fileId: string): Promise<CommentTarget> {
+    if (this.#scope.kind === "file" && fileId !== this.#scope.fileId) outsideScope();
+    let file = await this.#fetchFile(fileId);
+    if (file.id !== fileId) outsideScope();
+    await this.authorizeFiles([file.id], "Open Google Drive comments",
+      `Check current metadata for Drive file ${file.id} to work with its comments.`);
+    return {fileId: file.id, name: file.name, ...(file.mimeType ? {mimeType: file.mimeType} : {})};
+  }
+
+  /** A {@link commentTarget}'s comments, page by page. */
+  commentPager(fileId: string, readPage: CommentPageReader): Pager<DriveComment> {
+    return this.commentPages(fileId, [{kind: "file", fileId}], readPage);
+  }
+
+  async #cursor(query: DriveListFilesOptions): Promise<Pager<DriveEntry>> {
+    return new CursorPager<DriveFile, DriveEntry>({
+      provider: "Google Drive",
+      fetchPage: async pageToken => {
+        let page = await this.api.listFiles({...query, corpus: {kind: "user"}, pageToken});
+        return {items: page.files, ...(page.nextPageToken ? {nextPageToken: page.nextPageToken} : {})};
+      },
+      buildEntries: async files => files.map(file => driveFileToEntry(file)),
+      authorize: this.pageAuthorizer(this.#scope, query),
+    });
+  }
+
+  #exactFileCursor(): Pager<DriveEntry> {
+    let fileId = this.#scope.kind === "file" ? this.#scope.fileId : outsideScope();
+    return new CursorPager<DriveFile, DriveEntry>({
+      provider: "Google Drive",
+      fetchPage: async () => ({items: [await this.api.getFile(fileId)]}),
+      buildEntries: async files => {
+        if (files.length !== 1 || files[0].id !== fileId) outsideScope();
+        return files[0].trashed === false ? [driveFileToEntry(files[0])] : [];
+      },
+      authorize: async () => this.authorizeFiles([fileId], "Read Google Drive metadata",
+        `Read metadata for Drive file ${fileId}.`),
+    });
+  }
+
+  async #assertParent(parentId: string): Promise<void> {
+    if (this.#scope.kind === "file") outsideScope();
+    let parent = await this.#fetchFile(parentId);
+    if (parent.id !== parentId) outsideScope();
+    let title = "Check Google Drive folder";
+    let description = "Check that the requested parent folder belongs to this Drive binding.";
+    if (!isListableFolderFile(parent)) {
+      // On a live folder only `canListChildren` is relative to the connected account; a
+      // non-folder or a trashed one is an objective refusal a listing would disclose anyway.
+      if (parent.mimeType === FOLDER_MIME_TYPE && parent.trashed === false) {
+        await this.authorizeAccountRelative(title, description);
+      } else {
+        await this.authorizeFiles([parent.id], title, description);
+      }
+      throw new Error("directParentId must identify a folder whose children can be listed");
+    }
+    // A folder unit, not a file: the disclosure is that this account can list the folder, which a
+    // metadata-only observer must fail rather than pass vacuously.
+    await this.authorizeUnits([{kind: "folder", fileId: parent.id}], title, description);
+  }
+
+  /**
+   * Report an account-relative refusal without retaining an unsatisfiable file requirement.
+   * Hide Google's per-file reason so a failed probe discloses no file metadata.
+   */
+  async #fetchFile(fileId: string): Promise<DriveFile> {
+    try {
+      return await this.api.getFile(fileId);
+    } catch (error) {
+      // A missing OAuth scope is an account-wide failure, not an invisible-file result.
+      if (isInsufficientScope(error)) throw error;
+      if (this.#scope.kind === "account" && isFileInvisible(error)) {
+        await this.authorizeAccountRelative("Check Google Drive file access",
+          `Check whether the connected account can access Drive file ${fileId}.`);
+        // Do not expose the provider's file-specific reason through the RPC error's cause.
+        // eslint-disable-next-line preserve-caught-error
+        throw new Error("The requested Drive file is unavailable to the connected account.");
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * The positioned folder is the only parent a folder binding searches, so a caller-supplied one is
+ * refused rather than dropped: the provider call overrides it, but it would still reach the
+ * observation description and report a folder that was never read.
+ */
+function rejectDirectParent(query: DriveFolderListOptions | DriveFolderSearchQuery): void {
+  if ((query as DriveSearchQuery).directParentId !== undefined) {
+    throw new Error("A Drive folder binding is already scoped; directParentId is not accepted.");
+  }
+}
+
+/** Only a positioned folder has child folders to search, so an account caller is refused here. */
+function rejectChildFolders(query: DriveSearchQuery): void {
+  if ((query as DriveFolderSearchQuery).childFolderIds !== undefined) {
+    throw new Error(
+      "Only a Drive folder binding can search child folders; childFolderIds is not accepted.");
+  }
+}
+
+/** Direct-child Drive access positioned at one provider-validated folder path. */
+export class DriveFolderSessionCore extends DriveCoreBase {
+  #location: FolderLocation;
+
+  constructor(options: DriveFolderSessionCoreOptions) {
+    super(options);
+    this.#location = {folderIds: [...options.location.folderIds]};
+  }
+
+  async getScope(): Promise<DriveScope> {
+    let path = await this.#readLocation();
+    let folder = await this.#readCurrentFolder(path);
+    await this.#readLocation();
+    await this.authorizeUnits([this.#folderObservation()], "Read Google Drive scope",
+      "Read the current name of the connected Drive folder.");
+    return {
+      kind: "folder", folderId: folder.id, rootFolderId: this.#rootId(), name: folder.name,
+      access: this.access,
+    };
+  }
+
+  async list(options: DriveFolderListOptions = {}): Promise<Pager<DriveEntry>> {
+    rejectDirectParent(options);
+    return this.#cursor({orderBy: orderBy(options.order)});
+  }
+
+  async search(query: DriveFolderSearchQuery): Promise<Pager<DriveEntry>> {
+    rejectDirectParent(query);
+    let {childFolderIds, ...filters} = query;
+    let children = narrowingChildFolderIds(childFolderIds);
+    let normalized = normalizeSearch(filters);
+    return this.#cursor({
+      ...normalized,
+      orderBy: normalized.fullTextContains ? null : orderBy(normalized.order),
+    }, children);
+  }
+
+  async getEntry(fileId: string): Promise<DriveEntry> {
+    let file = await this.#requireDirectFile(fileId);
+    await this.authorizeUnits(
+      [this.#folderObservation(), {kind: "file", fileId: file.id}],
+      "Read Google Drive metadata", `Read metadata for Drive file ${file.id}.`);
+    return driveFileToEntry(file);
+  }
+
+  /** Only a live direct child of the positioned folder can be opened. */
+  async openFile(fileId: string, description: string): Promise<DriveFile> {
+    let file = await this.#requireDirectFile(fileId);
+    await this.authorizeUnits(
+      [this.#folderObservation(), {kind: "file", fileId: file.id}],
+      `Open ${description} from Google Drive`,
+      `Check current metadata for Drive file ${file.id} and open it as a ${description}.`,
+    );
+    return file;
+  }
+
+  /**
+   * Disclose why a folder cannot stand as a parent here, then refuse.
+   *
+   * Only `canListChildren` is relative to the connected account; a non-folder or a trashed one is
+   * an objective refusal `list()` would disclose anyway, so it is reported as a file unit.
+   */
+  async #refuseUnlistable(node: DriveScopeNode): Promise<never> {
+    let title = "Check Google Drive folder";
+    let description = "Check whether a requested folder can be opened here.";
+    if (node.mimeType === FOLDER_MIME_TYPE) await this.authorizeAccountRelative(title, description);
+    else {
+      await this.authorizeUnits(
+        [this.#folderObservation(), {kind: "file", fileId: node.id}], title, description);
+    }
+    outsideScope();
+  }
+
+  /** Open one live, listable direct child folder and append its checked path edge. */
+  async openFolder(folderId: string): Promise<FolderLocation> {
+    let folder = await this.#requireDirectFile(folderId);
+    if (!isListableFolderFile(folder)) await this.#refuseUnlistable(folder);
+    await this.authorizeUnits(
+      [this.#folderObservation(), {kind: "folder", fileId: folder.id}],
+      "Open Google Drive folder", `Open direct child folder ${folder.id}.`);
+    return {folderIds: [...this.#location.folderIds, folder.id]};
+  }
+
+  /** Validate and authorize one direct child whose comments are about to be read or written. */
+  async commentTarget(fileId: string): Promise<CommentTarget> {
+    let file = await this.#requireDirectFile(fileId);
+    await this.authorizeUnits(
+      [this.#folderObservation(), {kind: "file", fileId: file.id}], "Open Google Drive comments",
+      `Check current metadata for Drive file ${file.id} to work with its comments.`);
+    return {
+      fileId: file.id,
+      name: file.name,
+      ...(file.mimeType ? {mimeType: file.mimeType} : {}),
+      folderIds: [...this.#location.folderIds],
+    };
+  }
+
+  /**
+   * A {@link commentTarget}'s comments, page by page. The saved path and the direct child are
+   * proven before each fetch and again after it, so a file moved out mid-listing ends it.
+   */
+  commentPager(fileId: string, readPage: CommentPageReader): Pager<DriveComment> {
+    return this.commentPages(fileId, [this.#folderObservation(), {kind: "file", fileId}], readPage,
+      () => this.#requireDirectFile(fileId));
+  }
+
+  /**
+   * Revalidate the saved path and direct child on every Docs, Sheets, Slides, PDF or file read,
+   * which reports the folder it listed and the child it found there as well as the file it read.
+   */
+  nativeRead(
+    fileId: string, expectedMimeType: string, {content, unchanged}: NativeReadOptions = {},
+  ): NativeRead {
+    let subresources = fileSubresourceIds([
+      this.#folderObservation(), {kind: "file", fileId},
+      nativeSubresource(fileId, expectedMimeType, content),
+    ]);
+    let requireCurrent = async () => {
+      let file = await this.#requireDirectFile(fileId);
+      if (file.mimeType !== expectedMimeType) outsideScope();
+      unchanged?.(file);
+    };
+    return async <T>(fetch: () => Promise<T>, observe: (value: T) => NativeObservation) => {
+      await requireCurrent();
+      let value = await fetch();
+      await requireCurrent();
+      await this.authorize({...observe(value), subresources});
+      return value;
+    };
+  }
+
+  /**
+   * The bound drive is learned from the first page's own revalidation rather than a read taken
+   * before the cursor is returned, so calling `list()` and never paging authorizes nothing and
+   * discloses nothing about the saved path.
+   */
+  #cursor(
+    query: DriveListFilesOptions,
+    childFolderIds?: readonly string[],
+  ): Pager<DriveEntry> {
+    let bound: {driveId: string | undefined} | undefined;
+    // Revalidated per page: the saved path, plus any named child folders, since one moved out
+    // mid-pagination would otherwise keep having its contents disclosed as in scope.
+    let readScope = async (): Promise<FolderPageScope> => {
+      let path = await this.#readLocation();
+      bound ??= {driveId: path[0].driveId};
+      if (bound.driveId !== path[0].driveId) throw new Error(FOLDER_MOVED);
+      let current = path[path.length - 1];
+      return {
+        driveId: path[0].driveId,
+        parents: childFolderIds
+          ? await this.#requireChildFolders(childFolderIds, current)
+          : [current],
+      };
+    };
+    // `buildEntries` and the authorizer run back to back with no provider read between them, so
+    // they share one post-fetch proof instead of taking the same batches twice.
+    let afterFetch: Promise<FolderPageScope> | undefined;
+    let sinceFetch = () => (afterFetch ??= readScope());
+    let parentIds = childFolderIds ?? [this.#currentFolderId()];
+    let audited = childFolderIds ? {...query, directParentIds: childFolderIds} : query;
+    return new CursorPager<DriveFile, DriveEntry>({
+      provider: "Google Drive",
+      fetchPage: async pageToken => {
+        afterFetch = undefined;
+        let {driveId} = await readScope();
+        let page = await this.api.listFiles({
+          ...query,
+          directParentIds: parentIds,
+          corpus: driveId ? {kind: "drive", driveId} : {kind: "user"},
+          pageToken,
+        });
+        return {items: page.files, ...(page.nextPageToken ? {nextPageToken: page.nextPageToken} : {})};
+      },
+      buildEntries: async files => {
+        let {parents} = await sinceFetch();
+        if (files.some(file => !parents.some(parent => isDirectChild(file, parent)))) outsideScope();
+        return files.map(file => driveFileToEntry(file));
+      },
+      authorize: this.pageAuthorizer(
+        {kind: "folder", folderId: this.#currentFolderId()}, audited,
+        {revalidate: sinceFetch, baseUnits: [
+          this.#folderObservation(),
+          ...(childFolderIds ?? []).map(id => ({kind: "folder" as const, fileId: id})),
+        ]}),
+    });
+  }
+
+  /**
+   * Prove every named folder is a listable direct child of `current`, in one batch.
+   *
+   * Same predicate as {@link openFolder}: invisible or live-but-unlistable is relative to the
+   * connected account and reported with `subresources: []`, while a non-folder, a trashed one,
+   * or a non-child is an objective refusal a listing of this folder would disclose anyway.
+   */
+  async #requireChildFolders(
+    folderIds: readonly string[], current: DriveScopeNode,
+  ): Promise<DriveScopeNode[]> {
+    let nodes = await this.api.getScopeNodes(folderIds);
+    for (let node of nodes) {
+      if (!node) {
+        await this.authorizeAccountRelative("Check Google Drive folder",
+          "Check whether a requested folder is a listable direct child here.");
+        outsideScope();
+      }
+      if (!isDirectChild(node, current)) outsideScope();
+      if (!isListableFolderNode(node)) await this.#refuseUnlistable(node);
+    }
+    return nodes as DriveScopeNode[];
+  }
+
+  async #readLocation(): Promise<DriveScopeNode[]> {
+    return readFolderLocation(this.#location, ids => this.api.getScopeNodes(ids));
+  }
+
+  async #readCurrentFolder(path: DriveScopeNode[]): Promise<DriveFile> {
+    let current = path[path.length - 1];
+    let folder = await this.tryFetchFile(current.id);
+    if (!folder || folder.id !== current.id || !isListableFolderFile(folder) ||
+        folder.driveId !== path[0].driveId ||
+        (path.length > 1 && !isDirectChild(folder, path[path.length - 2]))) {
+      outsideScope();
+    }
+    return folder;
+  }
+
+  async #requireDirectFile(fileId: string): Promise<DriveFile> {
+    let path = await this.#readLocation();
+    let file = await this.tryFetchFile(fileId);
+    if (!file || file.id !== fileId) {
+      // Invisible to this account, an answer relative to it alone. Whether a visible file is a
+      // direct child is objective, so refusing that discloses nothing either.
+      await this.authorizeAccountRelative(
+        "Check Google Drive folder",
+        "Check whether a requested file is a direct child of this Drive folder.");
+      outsideScope();
+    }
+    if (!isDirectChild(file, path[path.length - 1])) outsideScope();
+    await this.#readLocation();
+    return file;
+  }
+
+  #rootId(): string {
+    return this.#location.folderIds[0];
+  }
+
+  #currentFolderId(): string {
+    return this.#location.folderIds[this.#location.folderIds.length - 1];
+  }
+
+  #folderObservation(): DriveObservation {
+    return {kind: "folder", fileId: this.#currentFolderId()};
+  }
+}
